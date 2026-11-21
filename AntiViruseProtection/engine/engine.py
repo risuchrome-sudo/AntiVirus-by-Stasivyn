@@ -1,24 +1,24 @@
-"""Stasivyn Security scanning engine foundation.
-
-This module is deliberately separate from the Tkinter interface.
-
-IMPORTANT:
-- A file not found in the local hash database is UNKNOWN, not CLEAN.
-- The local TXT database is supplied by the updater; unmatched hashes remain unknown.
-- This module does not provide real-time protection or secure quarantine yet.
-"""
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import string
 import tempfile
+import threading
+import time
+import uuid
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event
 from typing import Callable, Iterator
+
+from .YARA.yara_scanner import get_yara_status, scan_file_with_yara
+from .baseline import ScanBaseline
+from .native_engine import NativeScanError, load_native_engine
 
 
 APP_NAME = "Stasivyn Security"
@@ -26,8 +26,24 @@ ENGINE_VERSION = "0.1.0"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "Updater" / "data"
 HASH_DATABASE_PATH = DATA_DIR / "threat_hashes.txt"
+QUARANTINE_DIR = BASE_DIR / "quarantine" / "files"
+QUARANTINE_INDEX = QUARANTINE_DIR / "quarantine_index.json"
+INSPECTION_DIR = QUARANTINE_DIR / "inspection"
+INSPECTION_INDEX = QUARANTINE_DIR / "inspection_index.json"
 _HASH_DATABASE_CACHE: dict[str, str] | None = None
 _HASH_DATABASE_CACHE_KEY: tuple[int, int] | None = None
+_BASELINE = ScanBaseline()
+_BASELINE.set_definition(HASH_DATABASE_PATH, BASE_DIR / "YARA" / "rules")
+PROTECTION_RECHECK_SECONDS = 18_000
+_MONITOR_STOP: Event | None = None
+_MONITOR_THREAD: threading.Thread | None = None
+_NATIVE_ENGINE = None
+try:
+    _NATIVE_ENGINE = load_native_engine()
+except (OSError, NativeScanError) as error:
+    _NATIVE_ENGINE_ERROR = str(error)
+else:
+    _NATIVE_ENGINE_ERROR = None
 
 
 # ---------------------------------------------------------------------------
@@ -39,11 +55,13 @@ class ScanResult:
     """Result for one inspected file."""
 
     path: str
-    status: str  # known_threat, unknown, or error
+    status: str  # known_threat, suspicious, unknown, or error
     sha256: str | None = None
     threat_name: str | None = None
     message: str = ""
     category: str = "Files"
+    yara_matches: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -53,6 +71,7 @@ class ScanSummary:
     scan_type: str
     scanned: int
     known_threats: int
+    suspicious_matches: int
     errors: int
     cancelled: bool
     results: list[ScanResult]
@@ -79,19 +98,34 @@ def get_engine_status() -> dict[str, str | bool | int]:
                 "hash_database": "invalid",
                 "definitions": False,
                 "definition_count": 0,
-                "realtime_protection": False,
+                "realtime_protection": _MONITOR_THREAD is not None and _MONITOR_THREAD.is_alive(),
+                "native_dll": _NATIVE_ENGINE is not None,
                 "message": "The hash database could not be read.",
             }
 
+    yara_status = get_yara_status()
+    yara_label = (
+        "ready"
+        if yara_status.compiled and not yara_status.warnings
+        else "partially ready"
+        if yara_status.compiled
+        else "unavailable or needs attention"
+    )
     return {
         "engine_version": ENGINE_VERSION,
         "scanner_available": True,
         "hash_database": "loaded" if database_size else "empty",
         "definitions": database_size > 0,
         "definition_count": database_size,
-        "realtime_protection": False,
+        "yara_available": yara_status.available,
+        "yara_compiled": yara_status.compiled,
+        "yara_rule_files": yara_status.rule_files,
+        "yara_warning_count": len(yara_status.warnings),
+        "realtime_protection": _MONITOR_THREAD is not None and _MONITOR_THREAD.is_alive(),
+        "native_dll": _NATIVE_ENGINE is not None,
         "message": (
-            f"Loaded {database_size} hash definition(s)."
+            f"Loaded {database_size} SHA-256 definition(s); "
+            f"YARA {yara_label}."
             if database_size
             else "No threat definitions are installed. Files can be hashed, but cannot be declared safe."
         ),
@@ -210,26 +244,59 @@ def detect_threat(path: str | Path) -> dict[str, str | None]:
 
 
 def scan_file(path: str | Path) -> ScanResult:
-    """Inspect a single file and return a structured result."""
+    """Inspect one file with exact SHA-256 matching and YARA heuristics."""
     file_path = Path(path).expanduser()
     try:
+        file_path = file_path.resolve()
+        stat = file_path.stat()
+        cached = _BASELINE.get(file_path, stat.st_size, stat.st_mtime_ns)
+        if cached is not None:
+            return ScanResult(
+                path=str(file_path), status=cached["status"], sha256=cached.get("sha256"),
+                threat_name=cached.get("threat_name"), yara_matches=list(cached.get("yara_matches", [])),
+                message="Unchanged since the last successful scan; result served from baseline cache.",
+            )
+        if _NATIVE_ENGINE is not None:
+            native_status, native_message = _NATIVE_ENGINE.scan(file_path)
+            file_hash = calculate_sha256(file_path)
+            result = ScanResult(path=str(file_path), status=native_status, sha256=file_hash, message=native_message)
+            _BASELINE.record(file_path, stat.st_size, stat.st_mtime_ns, result)
+            return result
         detection = detect_threat(file_path)
         if detection["status"] == "known_threat":
-            return ScanResult(
+            result = ScanResult(
                 path=detection["path"] or str(file_path),
                 status="known_threat",
                 sha256=detection["sha256"],
                 threat_name=detection["threat_name"],
                 message="File hash matched a local threat definition.",
             )
+            _BASELINE.record(file_path, stat.st_size, stat.st_mtime_ns, result)
+            return result
 
-        return ScanResult(
+        yara_matches, yara_warnings = scan_file_with_yara(file_path)
+        if yara_matches:
+            result = ScanResult(
+                path=detection["path"] or str(file_path),
+                status="suspicious",
+                sha256=detection["sha256"],
+                message="YARA heuristic rule(s) matched; this is not proof that the file is malicious.",
+                yara_matches=yara_matches,
+                warnings=yara_warnings,
+            )
+            _BASELINE.record(file_path, stat.st_size, stat.st_mtime_ns, result)
+            return result
+
+        result = ScanResult(
             path=detection["path"] or str(file_path),
             status="unknown",
             sha256=detection["sha256"],
-            message="No matching hash definition. This does not prove the file is safe.",
+            message="No matching hash or YARA rule. This does not prove the file is safe.",
+            warnings=yara_warnings,
         )
-    except (OSError, ValueError) as error:
+        _BASELINE.record(file_path, stat.st_size, stat.st_mtime_ns, result)
+        return result
+    except (OSError, ValueError, NativeScanError) as error:
         return ScanResult(
             path=str(file_path),
             status="error",
@@ -593,6 +660,7 @@ def _run_categorized_scan(
     visited: dict[str, ScanResult] = {}
     scanned = 0
     known_threats = 0
+    suspicious_matches = 0
     errors = 0
     cancelled = False
 
@@ -635,8 +703,13 @@ def _run_categorized_scan(
                 visited[identity] = result
                 results.append(result)
                 scanned += 1
+                for warning in result.warnings:
+                    if warning not in warnings:
+                        warnings.append(warning)
                 if result.status == "known_threat":
                     known_threats += 1
+                elif result.status == "suspicious":
+                    suspicious_matches += 1
                 elif result.status == "error":
                     errors += 1
                     category_errors[category] = category_errors.get(category, 0) + 1
@@ -649,10 +722,16 @@ def _run_categorized_scan(
         if cancelled:
             break
 
+    try:
+        _BASELINE.save()
+    except OSError as error:
+        warnings.append(f"Could not save scan baseline: {error}")
+
     return ScanSummary(
         scan_type=scan_type,
         scanned=scanned,
         known_threats=known_threats,
+        suspicious_matches=suspicious_matches,
         errors=errors,
         cancelled=cancelled,
         results=results,
@@ -722,35 +801,210 @@ def full_scan(
 
 
 # ---------------------------------------------------------------------------
-# 5. Quarantine (intentionally not implemented yet)
+# 5. Quarantine
 # ---------------------------------------------------------------------------
 
-def quarantine_file(path: str | Path) -> None:
-    """TODO: implement secure, reversible quarantine after review and testing."""
-    raise NotImplementedError(
-        "Quarantine is not implemented. Do not delete or move files automatically."
-    )
+def _load_quarantine_index() -> dict[str, object]:
+    try:
+        value = json.loads(QUARANTINE_INDEX.read_text(encoding="utf-8"))
+        if not isinstance(value, dict) or not isinstance(value.get("items", []), list):
+            raise ValueError("invalid quarantine index")
+        return value
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return {"version": 1, "items": []}
+
+
+def _save_index(index_path: Path, value: dict[str, object]) -> None:
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=index_path.parent,
+                                        prefix=".quarantine_index.", suffix=".tmp", delete=False) as handle:
+            temporary = handle.name
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, index_path)
+        temporary = None
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _save_quarantine_index(value: dict[str, object]) -> None:
+    _save_index(QUARANTINE_INDEX, value)
+
+
+def quarantine_file(path: str | Path) -> dict[str, str]:
+    """Move one explicitly selected file into reversible quarantine storage."""
+    source = Path(path).expanduser().resolve()
+    if not source.is_file() or source.is_symlink():
+        raise ValueError("Only an existing regular file can be quarantined.")
+    digest = calculate_sha256(source)
+    item_id = uuid.uuid4().hex
+    destination = QUARANTINE_DIR / f"{item_id}.quarantined"
+    stat = source.stat()
+    record = {
+        "id": item_id,
+        "original_path": str(source),
+        "stored_path": str(destination),
+        "sha256": digest,
+        "size": str(stat.st_size),
+        "mtime": str(stat.st_mtime_ns),
+        "quarantined_at": str(time.time()),
+    }
+    QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
+    os.replace(source, destination)
+    index = _load_quarantine_index()
+    items = index.setdefault("items", [])
+    if not isinstance(items, list):
+        items = []
+        index["items"] = items
+    items.append(record)
+    try:
+        _save_quarantine_index(index)
+    except Exception:
+        # Do not leave an untracked moved file if the index cannot be committed.
+        try:
+            os.replace(destination, source)
+        except OSError:
+            pass
+        raise
+    return record
 
 
 def get_quarantine_items() -> list[dict[str, str]]:
-    """TODO: return verified quarantine records after quarantine is implemented."""
-    raise NotImplementedError("Quarantine storage is not implemented yet.")
+    """Return index entries whose stored files still exist."""
+    items = _load_quarantine_index().get("items", [])
+    return [item for item in items if isinstance(item, dict) and Path(str(item.get("stored_path", ""))).is_file()]
 
 
 def restore_quarantined_file(file_id: str) -> None:
-    """TODO: safely restore a selected quarantined file after user confirmation."""
-    raise NotImplementedError("Quarantine restoration is not implemented yet.")
+    """Restore a quarantined file only when its recorded content is intact."""
+    index = _load_quarantine_index()
+    items = index.get("items", [])
+    selected = next((item for item in items if isinstance(item, dict) and item.get("id") == file_id), None)
+    if selected is None:
+        raise FileNotFoundError("Quarantine item was not found.")
+    stored = Path(str(selected.get("stored_path", ""))).resolve()
+    original = Path(str(selected.get("original_path", ""))).resolve()
+    if not stored.is_file() or calculate_sha256(stored) != selected.get("sha256"):
+        raise ValueError("Quarantined content is missing or failed integrity verification.")
+    if original.exists():
+        raise FileExistsError(f"Refusing to overwrite existing path: {original}")
+    original.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(stored, original)
+    index["items"] = [item for item in items if not (isinstance(item, dict) and item.get("id") == file_id)]
+    _save_quarantine_index(index)
+
+
+def copy_flagged_for_inspection(path: str | Path) -> dict[str, object]:
+    """Copy a flagged file for inspection without altering the original.
+
+    Copy failures are returned to the caller with the original path so the
+    user can inspect it manually. The copied file is never executed here.
+    """
+    source = Path(path).expanduser().resolve()
+    result: dict[str, object] = {"source_path": str(source), "copied": False}
+    try:
+        if not source.is_file() or source.is_symlink():
+            raise ValueError("The flagged path is not an accessible regular file.")
+        digest = calculate_sha256(source)
+        item_id = uuid.uuid4().hex
+        INSPECTION_DIR.mkdir(parents=True, exist_ok=True)
+        destination = INSPECTION_DIR / f"{item_id}.inspection"
+        shutil.copy2(source, destination)
+        if calculate_sha256(destination) != digest:
+            destination.unlink(missing_ok=True)
+            raise IOError("The inspection copy failed integrity verification.")
+        index = _load_quarantine_index()
+        inspection_index: dict[str, object]
+        try:
+            inspection_index = json.loads(INSPECTION_INDEX.read_text(encoding="utf-8"))
+            if not isinstance(inspection_index, dict) or not isinstance(inspection_index.get("items", []), list):
+                raise ValueError
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+            inspection_index = {"version": 1, "items": []}
+        record = {
+            "id": item_id,
+            "source_path": str(source),
+            "inspection_path": str(destination),
+            "sha256": digest,
+            "copied_at": time.time(),
+        }
+        inspection_items = inspection_index["items"]
+        assert isinstance(inspection_items, list)
+        inspection_items.append(record)
+        _save_index(INSPECTION_INDEX, inspection_index)
+        result.update({"copied": True, "inspection_path": str(destination), "id": item_id})
+    except (OSError, ValueError) as error:
+        result["error"] = str(error)
+    return result
 
 
 # ---------------------------------------------------------------------------
-# 6. Real-time protection (intentionally not implemented yet)
+# 6. Live protection and scheduled rechecks
 # ---------------------------------------------------------------------------
 
-def start_realtime_protection() -> None:
-    """TODO: add a tested Windows file-monitoring service; not active yet."""
-    raise NotImplementedError("Real-time protection is not implemented yet.")
+def _protection_roots() -> list[Path]:
+    targets = get_full_scan_targets()
+    roots: list[Path] = []
+    for category, paths in targets.items():
+        if category not in {"Running processes", "Windows Registry"}:
+            roots.extend(paths)
+    return roots
+
+
+def start_realtime_protection(
+    on_result: Callable[[ScanResult], None] | None = None,
+    roots: list[str | Path] | None = None,
+    poll_seconds: float = 5.0,
+) -> None:
+    """Monitor protection folders with a safe polling fallback.
+
+    This is deliberately a polling monitor: it works without a third-party
+    service and never executes or alters files. A future ReadDirectoryChangesW
+    backend can replace the discovery loop without changing this callback ABI.
+    """
+    global _MONITOR_STOP, _MONITOR_THREAD
+    stop_realtime_protection()
+    stop_event = threading.Event()
+    _MONITOR_STOP = stop_event
+    monitor_roots = [Path(value) for value in (roots or _protection_roots())]
+
+    def monitor() -> None:
+        known: dict[str, tuple[int, int]] = {}
+        while not stop_event.is_set():
+            for path in _iter_files(monitor_roots):
+                if stop_event.is_set():
+                    break
+                try:
+                    stat = path.stat()
+                    key = os.path.normcase(str(path.resolve()))
+                    marker = (stat.st_size, stat.st_mtime_ns)
+                    if known.get(key) == marker:
+                        continue
+                    known[key] = marker
+                    result = scan_file(path)
+                    if on_result is not None and result.status in {"known_threat", "suspicious", "error"}:
+                        on_result(result)
+                except OSError:
+                    continue
+            stop_event.wait(max(0.5, poll_seconds))
+
+    _MONITOR_THREAD = threading.Thread(target=monitor, name="StasivynFileMonitor", daemon=True)
+    _MONITOR_THREAD.start()
 
 
 def stop_realtime_protection() -> None:
-    """TODO: stop the Windows monitoring service after it is implemented."""
-    raise NotImplementedError("Real-time protection is not implemented yet.")
+    global _MONITOR_STOP, _MONITOR_THREAD
+    if _MONITOR_STOP is not None:
+        _MONITOR_STOP.set()
+    if _MONITOR_THREAD is not None and _MONITOR_THREAD is not threading.current_thread():
+        _MONITOR_THREAD.join(timeout=2)
+    _MONITOR_STOP = None
+    _MONITOR_THREAD = None

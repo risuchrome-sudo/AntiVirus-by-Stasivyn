@@ -2,24 +2,27 @@
 
 ## Quick Scan
 
-Quick Scan checks Downloads, Desktop, and available temporary folders.
+Checks Downloads, Desktop, and available temporary folders.
 
 ## Full Scan
 
-Full Scan starts automatically and checks Downloads, Desktop, temporary folders, the current user's AppData folders, running process executable files, and files referenced by selected Windows Registry startup and service entries.
+Checks Downloads, Desktop, temporary folders, the current user's AppData folders, running process executable paths, and selected Windows Registry startup/service entries. It does not scan every drive, process memory, or every registry key.
 
-Process inspection reads executable paths only. It does not inspect process memory or stop processes. Registry inspection is read-only and limited to common Run, RunOnce, Winlogon, and service ImagePath entries. This is not a complete scan of every drive, every registry key, or every process's memory.
+## Detection results
 
-## Results
+- **Known hash match:** the file's SHA-256 exactly matches an entry in the local MalwareBazaar-derived hash database.
+- **YARA heuristic match:** one or more rules matched. This is suspicious and needs manual review; it is not proof that the file is malware.
+- **Unknown:** no local hash or YARA rule matched. This does not prove the file is safe.
+- **Error:** the file could not be inspected.
 
-The scan summary lists unique files inspected, known SHA-256 matches, errors, process count, registry entries checked, per-category file candidates, and warnings. Inaccessible paths may be skipped and appear in warnings. Run with appropriate Windows permissions to improve coverage; the application does not silently claim inaccessible locations are clean.
+YARA rules are compiled by `engine/YARA/yara_scanner.py` when first needed and recompiled when rule files change. The scanner includes `.yar` and `.yara` files recursively under `engine/YARA/rules/`.
 
-A hash that does not match the local database is unknown, not proven safe. The scanner does not move, delete, or quarantine detected files.
+## Safety and remaining features
+
+Scans are read-only. They do not move, delete, terminate, or quarantine files. Quarantine and real-time protection are not implemented yet. Process inspection reads executable file paths only; it does not inspect process memory. Registry inspection is read-only and limited to selected startup and service entries.
 
 ## Run
 
-From the project folder on Windows:
-
 ```powershell
-py interface\interface.py
+.venv\Scripts\python.exe interface\interface.py
 ```

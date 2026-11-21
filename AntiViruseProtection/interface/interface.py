@@ -65,6 +65,24 @@ class StasivynSecurity:
 
         self._build_shell()
         self.show_page("Dashboard")
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
+        if scan_engine is not None:
+            scan_engine.start_realtime_protection(on_result=self._queue_realtime_result)
+            self.root.after(1000, self._start_full_scan)
+            self.root.after(scan_engine.PROTECTION_RECHECK_SECONDS * 1000, self._scheduled_recheck)
+
+    def _close(self):
+        if scan_engine is not None:
+            scan_engine.stop_realtime_protection()
+        self.root.destroy()
+
+    def _queue_realtime_result(self, result):
+        self.scan_queue.put(("realtime", result))
+
+    def _scheduled_recheck(self):
+        if self.root.winfo_exists():
+            self._start_full_scan()
+            self.root.after(scan_engine.PROTECTION_RECHECK_SECONDS * 1000, self._scheduled_recheck)
 
     def _build_shell(self):
         topbar = tk.Frame(
@@ -254,7 +272,13 @@ class StasivynSecurity:
         except Exception:
             return "●  Engine error"
         if status.get("hash_database") == "loaded":
-            return "●  Engine connected"
+            if status.get("yara_compiled") and status.get("yara_warning_count", 0):
+                return "●  Engine connected · YARA partially ready"
+            if status.get("yara_compiled") and status.get("yara_rule_files", 0):
+                return "●  Engine connected · YARA ready"
+            if status.get("yara_available"):
+                return "●  Engine connected · YARA needs attention"
+            return "●  Engine connected · hash scanning only"
         if status.get("hash_database") == "empty":
             return "●  Engine connected · no definitions"
         return "●  Engine needs attention"
@@ -295,7 +319,7 @@ class StasivynSecurity:
 
             def report_progress(scanned, result):
                 now = time.monotonic()
-                important_result = result.status in {"known_threat", "error"}
+                important_result = result.status in {"known_threat", "suspicious", "error"}
                 if scanned == 1 or scanned % 25 == 0 or important_result or now - last_progress_time[0] >= 0.25:
                     self.scan_queue.put(("progress", scanned, result))
                     last_progress_time[0] = now
@@ -339,7 +363,13 @@ class StasivynSecurity:
                 message = self.scan_queue.get_nowait()
                 kind = message[0]
 
-                if kind == "progress":
+                if kind == "realtime":
+                    result = message[1]
+                    self.scan_status_var.set("Live protection detected activity.")
+                    self.scan_detail_var.set(f"{result.status}: {result.path}")
+                    if result.status in {"known_threat", "suspicious"}:
+                        messagebox.showwarning("Stasivyn detection", f"{result.message}\n\n{result.path}", parent=self.root)
+                elif kind == "progress":
                     _, scanned, result = message
                     path_text = result.path
                     if len(path_text) > 95:
@@ -360,8 +390,9 @@ class StasivynSecurity:
                     ending = "cancelled" if summary.cancelled else "completed"
                     self.scan_status_var.set(f"{summary.scan_type} {ending}.")
                     self.scan_detail_var.set(
-                        f"Files scanned: {summary.scanned} · Known threats: "
-                        f"{summary.known_threats} · Errors: {summary.errors}"
+                        f"Files scanned: {summary.scanned} · Hash matches: "
+                        f"{summary.known_threats} · YARA flags: {summary.suspicious_matches} · "
+                        f"Errors: {summary.errors}"
                     )
                     self._show_scan_summary(summary)
 
@@ -385,10 +416,15 @@ class StasivynSecurity:
             result for result in summary.results
             if result.status == "known_threat"
         ]
+        suspicious_results = [
+            result for result in summary.results
+            if result.status == "suspicious"
+        ]
         lines = [
             f"Scan: {summary.scan_type}",
             f"Unique files inspected: {summary.scanned}",
             f"Known hash matches: {summary.known_threats}",
+            f"Files flagged by YARA: {summary.suspicious_matches}",
             f"Inspection errors: {summary.errors}",
             f"Running processes found: {summary.processes_found}",
             f"Registry entries checked: {summary.registry_entries_checked}",
@@ -405,21 +441,55 @@ class StasivynSecurity:
                 lines.append(f"…and {len(summary.warnings) - 8} more.")
         lines.extend([
             "",
-            "No files were moved, deleted, or quarantined.",
-            "A file with no matching hash is UNKNOWN, not proven safe.",
+            "No files were automatically moved, deleted, or quarantined. Review detections from the Quarantine page.",
+            "A file with no matching hash or YARA rule is UNKNOWN, not proven safe.",
+            "YARA matches are heuristic indicators and require manual review.",
             "Process scanning checks executable file paths, not process memory.",
             "Registry scanning checks selected startup and service entries read-only.",
         ])
         if threat_results:
-            lines.extend(["", "Matching files:"])
+            lines.extend(["", "Known hash matches:"])
             for result in threat_results[:8]:
                 lines.append(f"• {result.threat_name or 'Known threat'}: {result.path}")
             if len(threat_results) > 8:
                 lines.append(f"…and {len(threat_results) - 8} more.")
+        if suspicious_results:
+            lines.extend(["", "YARA heuristic matches (review manually):"])
+            for result in suspicious_results[:8]:
+                rule_names = ", ".join(result.yara_matches[:3])
+                lines.append(f"• {rule_names}: {result.path}")
+            if len(suspicious_results) > 8:
+                lines.append(f"…and {len(suspicious_results) - 8} more.")
 
         details = "\n".join(lines)
-        if threat_results:
-            messagebox.showwarning("Scan finished — matches found", details, parent=self.root)
+        if threat_results or suspicious_results:
+            messagebox.showwarning("Scan finished — detections require review", details, parent=self.root)
+            candidates = threat_results + suspicious_results
+            if messagebox.askyesno("Create inspection copies?", "Copy detected files to the inspection folder while leaving the originals untouched?", parent=self.root):
+                for result in candidates:
+                    copied = scan_engine.copy_flagged_for_inspection(result.path)
+                    if not copied.get("copied"):
+                        messagebox.showwarning("Inspection copy unavailable", f"Could not copy this file:\n{result.path}\n\n{copied.get('error', 'unknown error')}\n\nThe original path was preserved for manual inspection.", parent=self.root)
+            if messagebox.askyesno(
+                "Quarantine reviewed files?",
+                "Quarantine detected files one at a time? YARA matches are heuristic; review each path before confirming.",
+                parent=self.root,
+            ):
+                moved = 0
+                for result in candidates:
+                    if not messagebox.askyesno(
+                        "Confirm quarantine",
+                        f"Move this file to reversible quarantine?\n\n{result.path}",
+                        parent=self.root,
+                    ):
+                        continue
+                    try:
+                        scan_engine.quarantine_file(result.path)
+                        moved += 1
+                    except Exception as exc:
+                        messagebox.showerror("Quarantine failed", f"{result.path}\n\n{exc}", parent=self.root)
+                if moved:
+                    self.show_page("Quarantine")
         else:
             messagebox.showinfo("Scan finished", details, parent=self.root)
 
@@ -503,7 +573,7 @@ class StasivynSecurity:
             metrics.grid_columnconfigure(column, weight=1, uniform="metric")
 
         threat_count = (
-            str(self.last_scan_summary.known_threats)
+            str(self.last_scan_summary.known_threats + self.last_scan_summary.suspicious_matches)
             if self.last_scan_summary is not None else "—"
         )
         definition_count = "Unavailable"
@@ -513,10 +583,10 @@ class StasivynSecurity:
                 str(engine_status.get("definition_count", "0"))
                 if engine_status.get("hash_database") == "loaded" else "0"
             )
-        self._metric(metrics, 0, "THREATS FOUND", threat_count, "Last scan matches", "◈")
+        self._metric(metrics, 0, "MATCHES", threat_count, "Hash hits + YARA flags", "◈")
         self._metric(metrics, 1, "LAST SCAN", self.last_scan, "Most recent scan", "↺")
         self._metric(metrics, 2, "DEFINITIONS", definition_count, "SHA-256 signatures", "▤")
-        self._metric(metrics, 3, "PROTECTION", "Not active", "Real-time monitoring pending", "⌁")
+        self._metric(metrics, 3, "PROTECTION", "Active", "Polling monitor + 5-hour recheck", "⌁")
 
         activity_card = self._card(wrap)
         activity_card.pack(fill="both", expand=True)
@@ -662,29 +732,47 @@ class StasivynSecurity:
         ).pack(anchor="w", pady=(5, 0))
 
     def _quarantine_page(self):
-        self._page_header("Quarantine", "File isolation is not implemented yet.")
+        self._page_header("Quarantine", "Review isolated files and restore them only when you trust them.")
         wrap = tk.Frame(self.content, bg=COLORS["bg"])
         wrap.pack(fill="both", expand=True, padx=34, pady=(0, 30))
         card = self._card(wrap)
         card.pack(fill="x")
         inner = tk.Frame(card, bg=COLORS["panel"])
         inner.pack(fill="x", padx=24, pady=28)
+        items = scan_engine.get_quarantine_items() if scan_engine is not None else []
         tk.Label(
             inner,
-            text="Quarantine is not implemented yet",
+            text=f"Quarantined files ({len(items)})",
             bg=COLORS["panel"],
             fg=COLORS["text"],
             font=(FONT, 15, "bold"),
         ).pack(anchor="w")
-        tk.Label(
-            inner,
-            text="Scan results can identify matching files, but this build does not move, delete, or isolate them.",
-            bg=COLORS["panel"],
-            fg=COLORS["muted"],
-            font=(FONT, 9),
-            wraplength=720,
-            justify="left",
-        ).pack(anchor="w", pady=(8, 0))
+        if not items:
+            tk.Label(inner, text="No files are currently quarantined.", bg=COLORS["panel"],
+                     fg=COLORS["muted"], font=(FONT, 9)).pack(anchor="w", pady=(8, 0))
+        for item in items:
+            row = tk.Frame(inner, bg=COLORS["panel_alt"])
+            row.pack(fill="x", pady=(12, 0))
+            text = tk.Label(row, text=item.get("original_path", "Unknown path"), bg=COLORS["panel_alt"],
+                            fg=COLORS["text"], font=(FONT, 9), anchor="w")
+            text.pack(side="left", fill="x", expand=True, padx=12, pady=10)
+            self._button(row, "Restore", lambda item_id=item["id"]: self._restore_quarantine(item_id)).pack(
+                side="right", padx=8, pady=6
+            )
+
+    def _restore_quarantine(self, item_id):
+        if not messagebox.askyesno(
+            "Restore quarantined file",
+            "Restore this file to its original location? Only restore files you trust.",
+            parent=self.root,
+        ):
+            return
+        try:
+            scan_engine.restore_quarantined_file(item_id)
+        except Exception as exc:
+            messagebox.showerror("Restore failed", str(exc), parent=self.root)
+            return
+        self.show_page("Quarantine")
 
     def _settings_page(self):
         self._page_header("Settings", "Application and protection configuration.")
@@ -711,7 +799,7 @@ class StasivynSecurity:
         ).pack(anchor="w")
         tk.Label(
             inner,
-            text="Real-time file monitoring is not implemented yet. Scanning is currently started manually.",
+            text="Live protection monitors configured folders and schedules a full recheck every five hours.",
             bg=COLORS["panel"],
             fg=COLORS["muted"],
             font=(FONT, 8),
@@ -799,7 +887,7 @@ class StasivynSecurity:
         ).pack(anchor="w")
         tk.Label(
             inner,
-            text="Scanning uses exact SHA-256 hash matching. A file with no matching hash remains unknown, not proven safe. Quarantine and real-time protection are not implemented yet.",
+            text="Scanning uses SHA-256 matching followed by YARA heuristics. Unchanged results use safing.json as a cache, not a whitelist. Quarantine is not implemented.",
             bg=COLORS["panel"],
             fg=COLORS["muted"],
             font=(FONT, 9),

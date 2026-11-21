@@ -1,15 +1,3 @@
-"""Update the local SHA-256 threat database from MalwareBazaar.
-
-Expected project layout:
-    engine/
-        database_updater.py
-        data/
-            threat_hashes.txt
-
-Set MALWAREBAZAAR_API_KEY in the environment before running this script.
-No malware samples are downloaded; this script retrieves hash metadata only.
-"""
-
 from __future__ import annotations
 
 import argparse

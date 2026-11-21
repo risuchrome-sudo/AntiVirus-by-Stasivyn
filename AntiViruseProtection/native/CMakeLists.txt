@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(stasivyn LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+find_path(YARA_INCLUDE_DIR yara.h REQUIRED)
+find_library(YARA_LIBRARY NAMES yara yara-static REQUIRED)
+add_library(stasivyn SHARED stasivyn.cpp)
+target_include_directories(stasivyn PRIVATE ${YARA_INCLUDE_DIR})
+target_link_libraries(stasivyn PRIVATE ${YARA_LIBRARY} bcrypt)
